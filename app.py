@@ -1,9 +1,30 @@
+import os
+import firebase_admin
+from firebase_admin import credentials, firestore
 from flask import Flask, render_template, jsonify, request, send_file
-import sqlite3
 import pandas as pd
 from datetime import datetime
 
-app = Flask(__name__, template_folder='templates')
+# Explicitly set absolute template directory path for Render cloud environment
+base_dir = os.path.abspath(os.path.dirname(__file__))
+template_dir = os.path.join(base_dir, 'templates')
+
+app = Flask(__name__, template_folder=template_dir)
+
+# Initialize Firebase Firestore SDK
+try:
+    cred_path = os.path.join(base_dir, 'serviceAccountKey.json')
+    if not firebase_admin._apps:
+        if os.path.exists(cred_path):
+            cred = credentials.Certificate(cred_path)
+            firebase_admin.initialize_app(cred)
+            print("Firebase Initialized Successfully!")
+        else:
+            print("Warning: serviceAccountKey.json file not found.")
+    db = firestore.client()
+except Exception as e:
+    print(f"Firebase Initialization Error: {e}")
+    db = None
 
 # Active Faculty Session Variables
 active_session = {
@@ -12,108 +33,119 @@ active_session = {
     "room_no": "Lab-302"
 }
 
-# --- DATABASE INIT ---
-def init_db():
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS attendance (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            date TEXT NOT NULL,
-            time TEXT NOT NULL,
-            faculty_name TEXT,
-            lecture_name TEXT,
-            UNIQUE(student_id, date, lecture_name)
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# --- ROUTES ---
 @app.route('/')
 def index():
     return render_template('index.html')
 
-# Form Submit Endpoint (Auto Date & Time)
-@app.route('/submit_attendance', methods=['POST'])
-def submit_attendance():
+@app.route('/api/session', methods=['GET', 'POST'])
+def handle_session():
+    global active_session
+    if request.method == 'POST':
+        data = request.json
+        active_session['faculty_name'] = data.get('faculty_name', active_session['faculty_name'])
+        active_session['lecture_name'] = data.get('lecture_name', active_session['lecture_name'])
+        active_session['room_no'] = data.get('room_no', active_session['room_no'])
+        return jsonify({"status": "success", "session": active_session})
+    return jsonify(active_session)
+
+@app.route('/api/mark_attendance', methods=['POST'])
+def mark_attendance():
+    if not db:
+        return jsonify({"status": "error", "message": "Database not initialized"}), 500
+        
     data = request.json
     student_id = data.get('student_id')
     name = data.get('name')
     
-    now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")    # Automatic Date
-    time_str = now.strftime("%H:%M:%S")    # Automatic Time
+    if not student_id or not name:
+        return jsonify({"status": "error", "message": "Student ID and Name required"}), 400
 
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
+    now = datetime.now()
+    date_str = now.strftime('%Y-%m-%d')
+    time_str = now.strftime('%H:%M:%S')
+
+    record = {
+        'student_id': str(student_id).strip(),
+        'name': name.strip(),
+        'date': date_str,
+        'time': time_str,
+        'faculty_name': active_session['faculty_name'],
+        'lecture_name': active_session['lecture_name'],
+        'timestamp': firestore.SERVER_TIMESTAMP
+    }
 
     try:
-        cursor.execute(
-            "INSERT INTO attendance (student_id, name, date, time, faculty_name, lecture_name) VALUES (?, ?, ?, ?, ?, ?)",
-            (student_id, name, date_str, time_str, active_session["faculty_name"], active_session["lecture_name"])
-        )
-        conn.commit()
-        response = {"status": "success", "message": f"Attendance marked for {name} ({student_id})"}
-    except sqlite3.IntegrityError:
-        response = {"status": "error", "message": "Attendance already marked for this subject today!"}
-    finally:
-        conn.close()
+        # Check duplicate entry for the same student on the same date and lecture
+        docs = db.collection('attendance')\
+            .where('student_id', '==', record['student_id'])\
+            .where('date', '==', date_str)\
+            .where('lecture_name', '==', record['lecture_name'])\
+            .get()
 
-    return jsonify(response)
+        if len(docs) > 0:
+            return jsonify({"status": "warning", "message": f"Attendance already marked for {name} today!"}), 200
 
-@app.route('/set_faculty', methods=['POST'])
-def set_faculty():
-    global active_session
-    data = request.json
-    active_session["faculty_name"] = data.get("faculty_name")
-    active_session["lecture_name"] = data.get("lecture_name")
-    active_session["room_no"] = data.get("room_no")
-    return jsonify({"status": "success", "session": active_session})
+        db.collection('attendance').add(record)
+        return jsonify({"status": "success", "message": f"Attendance marked for {name}!"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/get_attendance')
+@app.route('/api/get_attendance', methods=['GET'])
 def get_attendance():
-    conn = sqlite3.connect("database.db")
-    df = pd.read_sql_query("SELECT student_id, name, date, time, faculty_name, lecture_name FROM attendance ORDER BY id DESC", conn)
-    conn.close()
-    return jsonify(df.to_dict(orient="records"))
+    if not db:
+        return jsonify([])
+    try:
+        docs = db.collection('attendance').order_by('date', direction=firestore.Query.DESCENDING).get()
+        data = []
+        for doc in docs:
+            d = doc.to_dict()
+            d['id'] = doc.id
+            if 'timestamp' in d:
+                del d['timestamp']
+            data.append(d)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify([])
 
-# Student Login Statistics API
-@app.route('/student_stats')
-def student_stats():
-    roll = request.args.get('roll')
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    
-    # Total conducted classes/sessions count
-    cursor.execute("SELECT COUNT(DISTINCT date || lecture_name) FROM attendance")
-    total_sessions = cursor.fetchone()[0] or 1
+@app.route('/api/student_stats/<student_id>', methods=['GET'])
+def student_stats(student_id):
+    if not db:
+        return jsonify({"error": "Database unavailable"}), 500
+    try:
+        docs = db.collection('attendance').where('student_id', '==', str(student_id).strip()).get()
+        records = [doc.to_dict() for doc in docs]
+        
+        total_lectures = 30 # Standard benchmark total
+        attended = len(records)
+        percentage = round((attended / total_lectures) * 100, 2) if total_lectures > 0 else 0
+        
+        return jsonify({
+            "student_id": student_id,
+            "name": records[0]['name'] if records else "Student",
+            "attended": attended,
+            "total": total_lectures,
+            "percentage": percentage,
+            "history": records
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    # Student attended sessions
-    cursor.execute("SELECT COUNT(*) FROM attendance WHERE student_id = ?", (roll,))
-    attended = cursor.fetchone()[0]
-    conn.close()
-
-    percentage = round((attended / total_sessions) * 100, 2) if total_sessions > 0 else 0
-    return jsonify({
-        "attended": attended,
-        "total_sessions": total_sessions,
-        "percentage": percentage
-    })
-
-@app.route('/download_excel')
-def download_excel():
-    conn = sqlite3.connect("database.db")
-    df = pd.read_sql_query("SELECT student_id as Roll_No, name as Student_Name, date as Date, time as Time, faculty_name as Faculty_Name, lecture_name as Lecture_Name FROM attendance", conn)
-    conn.close()
-    
-    filename = "Attendance_Master_Register.xlsx"
-    df.to_excel(filename, index=False)
-    return send_file(filename, as_attachment=True)
+@app.route('/export_excel', methods=['GET'])
+def export_excel():
+    if not db:
+        return "Database Error", 500
+    try:
+        docs = db.collection('attendance').get()
+        data = [doc.to_dict() for doc in docs]
+        for d in data:
+            d.pop('timestamp', None)
+            
+        df = pd.DataFrame(data)
+        file_path = os.path.join(base_dir, 'Attendance_Register.xlsx')
+        df.to_excel(file_path, index=False)
+        return send_file(file_path, as_attachment=True)
+    except Exception as e:
+        return str(e), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=True)
