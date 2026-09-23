@@ -3,7 +3,7 @@ import sqlite3
 import pandas as pd
 from datetime import datetime
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder='templates')
 
 # Active Faculty Session Variables
 active_session = {
