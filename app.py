@@ -1,22 +1,29 @@
 import os
+import json
 import firebase_admin
 from firebase_admin import credentials, firestore
 from flask import Flask, render_template, jsonify, request, send_file
 import pandas as pd
 from datetime import datetime
 
-# Explicitly set absolute template directory path for Render cloud environment
 base_dir = os.path.abspath(os.path.dirname(__file__))
 template_dir = os.path.join(base_dir, 'templates')
 
 app = Flask(__name__, template_folder=template_dir)
 
-# Initialize Firebase Firestore SDK
+# Initialize Firebase Firestore SDK safely handling line-breaks
 try:
     cred_path = os.path.join(base_dir, 'serviceAccountKey.json')
     if not firebase_admin._apps:
         if os.path.exists(cred_path):
-            cred = credentials.Certificate(cred_path)
+            with open(cred_path, 'r') as f:
+                cred_dict = json.load(f)
+            
+            # Auto-fix newlines in private key if formatted as string
+            if 'private_key' in cred_dict:
+                cred_dict['private_key'] = cred_dict['private_key'].replace('\\n', '\n')
+                
+            cred = credentials.Certificate(cred_dict)
             firebase_admin.initialize_app(cred)
             print("Firebase Initialized Successfully!")
         else:
@@ -75,7 +82,6 @@ def mark_attendance():
     }
 
     try:
-        # Check duplicate entry for the same student on the same date and lecture
         docs = db.collection('attendance')\
             .where('student_id', '==', record['student_id'])\
             .where('date', '==', date_str)\
@@ -115,7 +121,7 @@ def student_stats(student_id):
         docs = db.collection('attendance').where('student_id', '==', str(student_id).strip()).get()
         records = [doc.to_dict() for doc in docs]
         
-        total_lectures = 30 # Standard benchmark total
+        total_lectures = 30
         attended = len(records)
         percentage = round((attended / total_lectures) * 100, 2) if total_lectures > 0 else 0
         
